@@ -83,7 +83,10 @@ class PIIModelTrainer(Trainer):
             pii_labels=pii_labels,
         )
 
-        if self.pii_loss_fn is not None:
+        # Use CRF loss for PII if available, otherwise fall back
+        if "crf_loss" in outputs:
+            loss = outputs["crf_loss"]
+        elif self.pii_loss_fn is not None:
             loss = self.pii_loss_fn(outputs["pii_logits"], pii_labels)
         else:
             loss = functional.cross_entropy(

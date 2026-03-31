@@ -263,6 +263,24 @@ def export_to_onnx(
     logging.info(f"✅ PII detection model exported to: {onnx_path}")
     logging.info("   Outputs: pii_logits")
 
+    # Export CRF transition parameters for Viterbi decoding in Go
+    if hasattr(model, "crf"):
+        crf_params = {
+            "transitions": model.crf.transitions.detach().cpu().numpy().tolist(),
+            "start_transitions": model.crf.start_transitions.detach()
+            .cpu()
+            .numpy()
+            .tolist(),
+            "end_transitions": model.crf.end_transitions.detach()
+            .cpu()
+            .numpy()
+            .tolist(),
+        }
+        crf_path = output_path / "crf_transitions.json"
+        with open(crf_path, "w") as f:
+            json.dump(crf_params, f)
+        logging.info(f"✅ CRF transition parameters exported to: {crf_path}")
+
     # Copy tokenizer files to output directory
     logging.info("📋 Copying tokenizer files...")
     tokenizer_files = [
@@ -299,8 +317,6 @@ def export_to_onnx(
     # beyond 512, causing PII at the end of long texts to be missed.
     tokenizer_json_path = Path(output_path) / "tokenizer.json"
     if tokenizer_json_path.exists():
-        import json
-
         with open(tokenizer_json_path) as f:
             tok_data = json.load(f)
         if tok_data.get("truncation") is not None:
