@@ -115,8 +115,14 @@ class PIIDetectionModel(nn.Module):
         self.encoder = AutoModel.from_pretrained(model_name)
         hidden_size = self.encoder.config.hidden_size
 
-        # PII detection head
-        self.pii_classifier = nn.Linear(hidden_size, num_pii_labels)
+        # PII detection head (MLP with bottleneck)
+        self.pii_classifier = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, num_pii_labels),
+        )
 
         # Store label mappings
         self.num_pii_labels = num_pii_labels
