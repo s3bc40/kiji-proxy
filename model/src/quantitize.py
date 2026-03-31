@@ -115,18 +115,26 @@ def load_model(
 
     # Load model config
     config_path = model_path / "config.json"
+    # Map model_type shortnames to full HuggingFace model identifiers
+    model_type_defaults = {
+        "distilbert": "distilbert-base-cased",
+        "roberta": "roberta-base",
+        "deberta-v2": "microsoft/deberta-v3-small",
+    }
+
     if config_path.exists():
         with config_path.open() as f:
             model_config = json.load(f)
-        base_model_name = model_config.get("_name_or_path") or model_config.get(
-            "model_type", "distilbert"
-        )
-        if base_model_name == "distilbert":
-            base_model_name = "distilbert-base-cased"
+        base_model_name = model_config.get("_name_or_path", "")
+        if not base_model_name or base_model_name in model_type_defaults:
+            model_type = model_config.get("model_type", "distilbert")
+            base_model_name = model_type_defaults.get(
+                model_type, "microsoft/deberta-v3-small"
+            )
     else:
-        base_model_name = "distilbert-base-cased"
+        base_model_name = "microsoft/deberta-v3-small"
         logging.warning(
-            "⚠️  config.json not found, using default: distilbert-base-cased"
+            "⚠️  config.json not found, using default: microsoft/deberta-v3-small"
         )
 
     # Determine number of labels
