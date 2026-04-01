@@ -381,6 +381,37 @@ class DatasetProcessor:
 
         return weights
 
+    def _load_ai4privacy_samples(self, num_samples: int) -> list[dict]:
+        """Load samples from the ai4privacy/pii-masking-200k HuggingFace dataset.
+
+        Args:
+            num_samples: Number of English samples to load (0 = all).
+
+        Returns:
+            List of sample dicts with text, privacy_mask, coreferences, language, country.
+        """
+        from datasets import load_dataset
+
+        from model.dataset.huggingface.import_ai4privacy import (
+            convert_ai4privacy_sample,
+        )
+
+        label = "all" if num_samples == 0 else str(num_samples)
+        logging.info(f"Loading {label} samples from ai4privacy/pii-masking-200k...")
+        ds = load_dataset("ai4privacy/pii-masking-200k", split="train")
+        ds = ds.filter(lambda row: row.get("language") == "en")
+
+        samples = []
+        for row in ds:
+            if num_samples > 0 and len(samples) >= num_samples:
+                break
+            sample = convert_ai4privacy_sample(row)
+            if sample is not None:
+                samples.append(sample)
+
+        logging.info(f"Loaded {len(samples)} ai4privacy samples")
+        return samples
+
     def prepare_datasets(
         self, subsample_count: int = 0
     ) -> tuple[Dataset, Dataset, dict, dict]:
@@ -397,8 +428,18 @@ class DatasetProcessor:
         # Load all samples (raw text, privacy_mask)
         all_samples = self.load_training_samples()
 
+        # Load ai4privacy samples if configured (-1 = none, 0 = all, N = limit)
+        if self.config.num_ai4privacy_samples >= 0:
+            ai4p_samples = self._load_ai4privacy_samples(
+                self.config.num_ai4privacy_samples
+            )
+            all_samples.extend(ai4p_samples)
+
         # Filter out None samples
         all_samples = [s for s in all_samples if s is not None]
+
+        # Shuffle before subsampling so ai4privacy samples are mixed in
+        random.Random(self.config.seed).shuffle(all_samples)
 
         # Subsample if requested
         if subsample_count > 0 and len(all_samples) > subsample_count:

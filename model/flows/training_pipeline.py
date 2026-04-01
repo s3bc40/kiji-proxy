@@ -137,6 +137,12 @@ class PIITrainingPipeline(FlowSpec):
             early_stopping_enabled=training_cfg.get("early_stopping_enabled", True),
             early_stopping_patience=training_cfg.get("early_stopping_patience", 3),
             early_stopping_threshold=training_cfg.get("early_stopping_threshold", 0.01),
+            num_ai4privacy_samples=int(
+                os.environ.get(
+                    "NUM_AI4PRIVACY_SAMPLES",
+                    cfg.get("data", {}).get("num_ai4privacy_samples", -1),
+                )
+            ),
             lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine_with_restarts"),
             lr_scheduler_num_cycles=training_cfg.get("lr_scheduler_num_cycles", 3),
             layerwise_lr_decay=training_cfg.get("layerwise_lr_decay", 0.95),
@@ -147,7 +153,12 @@ class PIITrainingPipeline(FlowSpec):
         self.skip_export = cfg.get("pipeline", {}).get("skip_export", False)
         self.skip_quantization = cfg.get("pipeline", {}).get("skip_quantization", False)
         self.skip_signing = cfg.get("pipeline", {}).get("skip_signing", False)
-        self.subsample_count = cfg.get("data", {}).get("subsample_count", 0)
+        self.subsample_count = int(
+            os.environ.get(
+                "NUM_SAMPLES",
+                cfg.get("data", {}).get("subsample_count", 0),
+            )
+        )
         self.pipeline_start_time = datetime.utcnow().isoformat()
         # Store raw config for export step
         self.raw_config = cfg
