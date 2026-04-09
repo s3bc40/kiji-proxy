@@ -85,6 +85,17 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Extract dependency versions
+        id: deps
+        run: |
+          set -euo pipefail
+          tokenizers="$(awk '/github.com\/daulet\/tokenizers/ { sub(/^v/, "", $2); print $2; exit }' go.mod)"
+          if [ -z "$tokenizers" ]; then
+            echo "Failed to determine tokenizers version from go.mod" >&2
+            exit 1
+          fi
+          echo "tokenizers=$tokenizers" >> "$GITHUB_OUTPUT"
+
       - name: Cache LFS objects
         uses: actions/cache@v5
         with:
@@ -97,7 +108,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/tokenizers/libtokenizers.a
-          key: ${{ runner.os }}-tokenizers-v1.23.0-prebuilt-v2
+          key: ${{ runner.os }}-tokenizers-v${{ steps.deps.outputs.tokenizers }}-prebuilt-v1
 
       - name: Cache ONNX Runtime library
         uses: actions/cache@v5
@@ -226,6 +237,17 @@ jobs:
           restore-keys: |
             lfs-${{ runner.os }}-
 
+      - name: Extract dependency versions
+        id: deps
+        run: |
+          set -euo pipefail
+          tokenizers="$(awk '/github.com\/daulet\/tokenizers/ { sub(/^v/, "", $2); print $2; exit }' go.mod)"
+          if [ -z "$tokenizers" ]; then
+            echo "Failed to determine tokenizers version from go.mod" >&2
+            exit 1
+          fi
+          echo "tokenizers=$tokenizers" >> "$GITHUB_OUTPUT"
+
       - name: Cache Go modules
         uses: actions/cache@v5
         with:
@@ -240,7 +262,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/tokenizers/libtokenizers.a
-          key: ${{ runner.os }}-tokenizers-v1.23.0-prebuilt-v2
+          key: ${{ runner.os }}-tokenizers-v${{ steps.deps.outputs.tokenizers }}-prebuilt-v1
 
       - name: Cache ONNX Runtime library
         uses: actions/cache@v5
