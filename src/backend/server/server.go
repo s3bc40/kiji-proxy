@@ -620,7 +620,8 @@ func (s *Server) handlePIICheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// detected_entities carries per-entity labels and spans so evaluators can
-	// score detection against a labeled dataset.
+	// score detection against a labeled dataset. The chrome extension derives
+	// its masked->label lookup from this to render the entity type column.
 	detected := make([]DetectedEntity, 0, len(entities))
 	for _, e := range entities {
 		detected = append(detected, DetectedEntity{
