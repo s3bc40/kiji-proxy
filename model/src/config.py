@@ -60,15 +60,15 @@ class TrainingConfig:
 
     # External dataset augmentation
     num_ai4privacy_samples: int = (
-        -1  # ai4privacy/pii-masking-200k samples to add (-1 = none, 0 = all)
+        -1  # ai4privacy/pii-masking-300k samples to add (-1 = none, 0 = all)
     )
 
     # Early stopping
     early_stopping_enabled: bool = True  # Enable early stopping
     early_stopping_patience: int = (
-        3  # Number of eval steps with no improvement before stopping
+        5  # Number of eval steps with no improvement before stopping
     )
-    early_stopping_threshold: float = 0.01  # Minimum improvement (1%) to qualify
+    early_stopping_threshold: float = 0.001  # Minimum improvement (0.1%) to qualify
 
     def __post_init__(self):
         """Create output directory after initialization."""
