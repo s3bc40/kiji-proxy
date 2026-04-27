@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -70,14 +71,14 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 	if onnxLibPath == "" {
 		onnxPaths := []string{
 			// macOS paths (.dylib)
-			"./libonnxruntime.1.24.2.dylib",            // CWD (legacy)
-			"./resources/libonnxruntime.1.24.2.dylib",  // Production DMG: CWD is Contents/Resources
-			"./build/libonnxruntime.1.24.2.dylib",      // Development: in build directory
-			"../libonnxruntime.1.24.2.dylib",           // Alternative location
+			"./libonnxruntime.1.24.2.dylib",           // CWD (legacy)
+			"./resources/libonnxruntime.1.24.2.dylib", // Production DMG: CWD is Contents/Resources
+			"./build/libonnxruntime.1.24.2.dylib",     // Development: in build directory
+			"../libonnxruntime.1.24.2.dylib",          // Alternative location
 			// Linux paths (.so)
-			"./lib/libonnxruntime.so.1.24.2",           // Linux release tarball layout
-			"./build/libonnxruntime.so.1.24.2",         // Development: in build directory
-			"./libonnxruntime.so.1.24.2",               // CWD
+			"./lib/libonnxruntime.so.1.24.2",   // Linux release tarball layout
+			"./build/libonnxruntime.so.1.24.2", // Development: in build directory
+			"./libonnxruntime.so.1.24.2",       // CWD
 		}
 
 		for _, p := range onnxPaths {
@@ -117,7 +118,11 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 
 	// Load model configuration
 	// Try multiple possible locations for the config file
+	modelDir := filepath.Dir(modelPath)
+	tokenizerDir := filepath.Dir(tokenizerPath)
 	configPaths := []string{
+		filepath.Join(modelDir, "label_mappings.json"),
+		filepath.Join(tokenizerDir, "label_mappings.json"),
 		"model/quantized/label_mappings.json", // Default location
 		"quantized/label_mappings.json",       // Alternative: in resources/quantized
 		"./label_mappings.json",               // Alternative: current directory
@@ -183,6 +188,8 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 	// instead the transition matrices are saved as a sidecar JSON file.
 	var crf *crfParams
 	crfPaths := []string{
+		filepath.Join(modelDir, "crf_transitions.json"),
+		filepath.Join(tokenizerDir, "crf_transitions.json"),
 		"model/quantized/crf_transitions.json",
 		"quantized/crf_transitions.json",
 		"./crf_transitions.json",
@@ -391,10 +398,192 @@ func softmaxConfidence(tokenLogits []float32, classIdx int) float64 {
 	return math.Exp(float64(tokenLogits[classIdx])-maxLogit) / sum
 }
 
+func splitBIOLabel(label string) (baseLabel string, isBeginning bool, isInside bool) {
+	isBeginning = strings.HasPrefix(label, "B-")
+	isInside = strings.HasPrefix(label, "I-")
+	if isBeginning || isInside {
+		return strings.TrimPrefix(strings.TrimPrefix(label, "B-"), "I-"), isBeginning, isInside
+	}
+	return label, false, false
+}
+
+func isEntityJoinerToken(tokenText string) bool {
+	trimmed := strings.TrimSpace(tokenText)
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		if !strings.ContainsRune(".,@_-+:/#%&=", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func tokenStartsAtPreviousEnd(tokenIndex int, currentTokens []int, offsets []tokenizers.Offset) bool {
+	if len(currentTokens) == 0 || tokenIndex >= len(offsets) {
+		return false
+	}
+	previousTokenIndex := currentTokens[len(currentTokens)-1]
+	if previousTokenIndex >= len(offsets) {
+		return false
+	}
+	return offsets[previousTokenIndex][1] == offsets[tokenIndex][0]
+}
+
+func tokenTextAt(originalText string, offsets []tokenizers.Offset, index int) string {
+	if index >= len(offsets) || offsets[index][0] >= uint(len(originalText)) || offsets[index][1] > uint(len(originalText)) {
+		return ""
+	}
+	return originalText[offsets[index][0]:offsets[index][1]]
+}
+
+func (d *ONNXModelDetectorSimple) decodedTokenLabel(index int, outputData []float32, bestLabels []int) (string, float64) {
+	startIdx := index * d.numPIILabels
+	endIdx := (index + 1) * d.numPIILabels
+	if startIdx < 0 || endIdx > len(outputData) {
+		return "O", 0
+	}
+
+	tokenLogits := outputData[startIdx:endIdx]
+	if bestLabels != nil && index < len(bestLabels) {
+		classID := bestLabels[index]
+		idStr := fmt.Sprintf("%d", classID)
+		label, ok := d.id2label[idStr]
+		if !ok {
+			label = "O"
+		}
+		return label, softmaxConfidence(tokenLogits, classID)
+	}
+
+	return d.classifyToken(tokenLogits)
+}
+
+type decodedEntityToken struct {
+	index       int
+	tokenID     uint32
+	text        string
+	label       string
+	baseLabel   string
+	confidence  float64
+	isBeginning bool
+	isInside    bool
+}
+
+func (d *ONNXModelDetectorSimple) decodeEntityToken(
+	index int,
+	tokenID uint32,
+	originalText string,
+	offsets []tokenizers.Offset,
+	outputData []float32,
+	bestLabels []int,
+	currentEntity *Entity,
+) decodedEntityToken {
+	label, confidence := d.decodedTokenLabel(index, outputData, bestLabels)
+	tokenText := tokenTextAt(originalText, offsets, index)
+
+	if confidence < d.entityConfidenceThreshold {
+		label = "O"
+	}
+	label, confidence = d.bridgeJoinerToken(index, tokenText, label, confidence, outputData, bestLabels, currentEntity)
+
+	baseLabel, isBeginning, isInside := splitBIOLabel(label)
+	return decodedEntityToken{
+		index:       index,
+		tokenID:     tokenID,
+		text:        tokenText,
+		label:       label,
+		baseLabel:   baseLabel,
+		confidence:  confidence,
+		isBeginning: isBeginning,
+		isInside:    isInside,
+	}
+}
+
+func (d *ONNXModelDetectorSimple) bridgeJoinerToken(
+	index int,
+	tokenText string,
+	label string,
+	confidence float64,
+	outputData []float32,
+	bestLabels []int,
+	currentEntity *Entity,
+) (string, float64) {
+	if label != "O" || currentEntity == nil || !isEntityJoinerToken(tokenText) {
+		return label, confidence
+	}
+
+	nextLabel, nextConfidence := d.decodedTokenLabel(index+1, outputData, bestLabels)
+	nextBaseLabel, nextIsBeginning, nextIsInside := splitBIOLabel(nextLabel)
+	if nextConfidence >= d.entityConfidenceThreshold &&
+		(nextIsBeginning || nextIsInside) &&
+		nextBaseLabel == currentEntity.Label {
+		return "I-" + currentEntity.Label, currentEntity.Confidence
+	}
+
+	return label, confidence
+}
+
+type entityGroupingState struct {
+	currentEntity *Entity
+	currentTokens []int
+	entities      []Entity
+}
+
+func (s *entityGroupingState) consume(
+	d *ONNXModelDetectorSimple,
+	token decodedEntityToken,
+	originalText string,
+	offsets []tokenizers.Offset,
+) {
+	isSameCompactEntity := token.label != "O" &&
+		s.currentEntity != nil &&
+		s.currentEntity.Label == token.baseLabel &&
+		tokenStartsAtPreviousEnd(token.index, s.currentTokens, offsets)
+
+	switch {
+	case token.label != "O" && s.currentEntity != nil && s.currentEntity.Label == token.baseLabel && (token.isInside || isSameCompactEntity):
+		// Continue current entity. Same-label B tags immediately after a
+		// joiner token are treated as continuation so emails like
+		// "jonathan.reyes@example.com" do not fragment.
+		s.currentTokens = append(s.currentTokens, token.index)
+		s.currentEntity.Confidence = (s.currentEntity.Confidence + token.confidence) / 2
+	case token.label != "O" && (token.isBeginning || s.currentEntity == nil):
+		s.finishCurrent(d, originalText, offsets)
+		s.currentEntity = &Entity{
+			Label:      token.baseLabel,
+			Confidence: token.confidence,
+		}
+		s.currentTokens = []int{token.index}
+	default:
+		s.finishCurrent(d, originalText, offsets)
+	}
+}
+
+func (s *entityGroupingState) finishCurrent(d *ONNXModelDetectorSimple, originalText string, offsets []tokenizers.Offset) {
+	if s.currentEntity == nil {
+		return
+	}
+
+	d.finalizeEntity(s.currentEntity, s.currentTokens, originalText, offsets)
+	s.entities = append(s.entities, *s.currentEntity)
+	s.currentEntity = nil
+	s.currentTokens = nil
+}
+
+func filterEmptyEntities(entities []Entity) []Entity {
+	filtered := entities[:0]
+	for _, e := range entities {
+		if e.Text != "" {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
 // processOutputInline converts model output to entities (inline to avoid compilation issues)
 func (d *ONNXModelDetectorSimple) processOutputInline(originalText string, tokenIDs []uint32, offsets []tokenizers.Offset) []Entity {
 	outputData := d.outputTensor.GetData()
-	entities := []Entity{}
 
 	// Ensure we don't process more tokens than we have
 	numTokens := len(tokenIDs)
@@ -411,8 +600,7 @@ func (d *ONNXModelDetectorSimple) processOutputInline(originalText string, token
 	}
 
 	// Group consecutive tokens with same label (B-PREFIX, I-PREFIX pattern)
-	var currentEntity *Entity
-	var currentTokens []int
+	state := entityGroupingState{}
 
 	// Process each token
 	for i := 0; i < numTokens; i++ {
@@ -423,91 +611,19 @@ func (d *ONNXModelDetectorSimple) processOutputInline(originalText string, token
 			fmt.Printf("[ONNX Model Response] Token %d: out of bounds (startIdx=%d, endIdx=%d, outputLen=%d)\n", i, startIdx, endIdx, len(outputData))
 			break // Reached end of output data
 		}
-		tokenLogits := outputData[startIdx:endIdx]
 
-		// Get label and confidence
-		var label string
-		var confidence float64
-		if bestLabels != nil {
-			// Viterbi path — look up label and compute softmax confidence
-			classID := bestLabels[i]
-			idStr := fmt.Sprintf("%d", classID)
-			var ok bool
-			label, ok = d.id2label[idStr]
-			if !ok {
-				label = "O"
-			}
-			confidence = softmaxConfidence(tokenLogits, classID)
-		} else {
-			label, confidence = d.classifyToken(tokenLogits)
-		}
-
-		// Log token details
-		tokenText := ""
-		if i < len(offsets) && offsets[i][0] < uint(len(originalText)) && offsets[i][1] <= uint(len(originalText)) {
-			tokenText = originalText[offsets[i][0]:offsets[i][1]]
-		}
+		token := d.decodeEntityToken(i, tokenIDs[i], originalText, offsets, outputData, bestLabels, state.currentEntity)
 		fmt.Printf("[ONNX Model Response] Token %d: id=%d text=%q offset=(%d,%d) label=%q confidence=%.4f\n",
-			i, tokenIDs[i], tokenText, offsets[i][0], offsets[i][1], label, confidence)
+			i, token.tokenID, token.text, offsets[i][0], offsets[i][1], token.label, token.confidence)
 
-		// Only process tokens with reasonable confidence
-		if confidence < d.entityConfidenceThreshold {
-			label = "O"
-		}
-
-		// Handle B-PREFIX (beginning) and I-PREFIX (inside) labels
-		isBeginning := strings.HasPrefix(label, "B-")
-		isInside := strings.HasPrefix(label, "I-")
-		baseLabel := label
-		if isBeginning || isInside {
-			baseLabel = strings.TrimPrefix(strings.TrimPrefix(label, "B-"), "I-")
-		}
-
-		// Handle different entity states using switch for better readability
-		switch {
-		case label != "O" && (isBeginning || currentEntity == nil):
-			// Finish previous entity if exists
-			if currentEntity != nil {
-				d.finalizeEntity(currentEntity, currentTokens, originalText, offsets)
-				entities = append(entities, *currentEntity)
-			}
-
-			// Start new entity
-			currentEntity = &Entity{
-				Label:      baseLabel,
-				Confidence: confidence,
-			}
-			currentTokens = []int{i}
-		case label != "O" && isInside && currentEntity != nil && currentEntity.Label == baseLabel:
-			// Continue current entity
-			currentTokens = append(currentTokens, i)
-			// Update confidence to average
-			currentEntity.Confidence = (currentEntity.Confidence + confidence) / 2
-		default:
-			// Finish current entity if exists
-			if currentEntity != nil {
-				d.finalizeEntity(currentEntity, currentTokens, originalText, offsets)
-				entities = append(entities, *currentEntity)
-				currentEntity = nil
-				currentTokens = nil
-			}
-		}
+		state.consume(d, token, originalText, offsets)
 	}
 
 	// Finish last entity if exists
-	if currentEntity != nil {
-		d.finalizeEntity(currentEntity, currentTokens, originalText, offsets)
-		entities = append(entities, *currentEntity)
-	}
+	state.finishCurrent(d, originalText, offsets)
 
 	// Filter out entities with empty text (e.g. from special tokens like [CLS]/[SEP])
-	filtered := entities[:0]
-	for _, e := range entities {
-		if e.Text != "" {
-			filtered = append(filtered, e)
-		}
-	}
-	entities = filtered
+	entities := filterEmptyEntities(state.entities)
 
 	fmt.Printf("[ONNX Model Response] Extracted %d entities from chunk:\n", len(entities))
 	for i, e := range entities {

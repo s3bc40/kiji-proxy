@@ -38,6 +38,11 @@ try:
 except ImportError:
     from .model import PIIDetectionModel
 
+try:
+    from model.src.checkpoint_utils import load_compatible_state_dict
+except ImportError:
+    from .checkpoint_utils import load_compatible_state_dict
+
 # Define command-line flags
 FLAGS = flags.FLAGS
 
@@ -105,12 +110,21 @@ def load_pytorch_model(
 
     # Load model config
     config_path = model_path / "config.json"
+    model_type_defaults = {
+        "bert": "bert-base-cased",
+        "distilbert": "distilbert-base-cased",
+        "roberta": "roberta-base",
+        "deberta-v2": "microsoft/deberta-v3-base",
+    }
     if config_path.exists():
         with config_path.open() as f:
             model_config = json.load(f)
-        base_model_name = model_config.get("_name_or_path", "microsoft/deberta-v3-base")
-        if base_model_name == "distilbert":
-            base_model_name = "distilbert-base-cased"
+        base_model_name = model_config.get("_name_or_path", "")
+        if not base_model_name or base_model_name in model_type_defaults:
+            model_type = model_config.get("model_type", "distilbert")
+            base_model_name = model_type_defaults.get(
+                model_type, "microsoft/deberta-v3-base"
+            )
     else:
         base_model_name = "microsoft/deberta-v3-base"
 
@@ -138,15 +152,16 @@ def load_pytorch_model(
             model_weights_path, map_location="cpu", weights_only=False
         )
 
-    # Handle 'model.' prefix
-    if any(k.startswith("model.") for k in state_dict.keys()):
-        state_dict = {
-            k.replace("model.", ""): v
-            for k, v in state_dict.items()
-            if k.startswith("model.")
-        }
-
-    model.load_state_dict(state_dict, strict=False)
+    load_info = load_compatible_state_dict(
+        model,
+        state_dict,
+        source=str(model_weights_path),
+    )
+    if load_info.unexpected_keys:
+        logging.warning(
+            "  Ignoring unexpected checkpoint keys: %s",
+            load_info.unexpected_keys[:20],
+        )
     model.eval()
 
     logging.info(f"  Loaded PyTorch model with {num_pii_labels} PII labels")
@@ -166,9 +181,9 @@ def load_onnx_model(
     logging.info(f"Loading ONNX model from: {model_path}")
 
     # Find ONNX model file
-    onnx_file = model_path / "model_quantized.onnx"
+    onnx_file = model_path / "model.onnx"
     if not onnx_file.exists():
-        onnx_file = model_path / "model.onnx"
+        onnx_file = model_path / "model_quantized.onnx"
     if not onnx_file.exists():
         onnx_files = list(model_path.glob("*.onnx"))
         if onnx_files:

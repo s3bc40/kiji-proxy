@@ -2,10 +2,10 @@
 Quantize PII Detection Model to ONNX Format
 
 This script:
-1. Loads the trained multi-task PII detection model
-2. Exports it to ONNX format (PII detection only for compatibility)
-3. Quantizes the model for faster inference
-4. Saves the quantized model
+1. Loads the trained PII detection model
+2. Exports it to ONNX format
+3. Optionally writes a quantized side artifact
+4. Keeps model.onnx as the default exported model
 
 Usage:
     # Basic usage (uses default paths):
@@ -19,15 +19,11 @@ Usage:
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
-import onnx
 import torch
 from absl import app, flags, logging
-from optimum.onnxruntime import ORTQuantizer
-from optimum.onnxruntime.configuration import AutoQuantizationConfig
 from safetensors import safe_open
 from transformers import AutoTokenizer
 
@@ -43,6 +39,11 @@ except ImportError:
     # Fallback for direct execution - import from same directory
     sys.path.insert(0, str(Path(__file__).parent))
     from model_signing import sign_trained_model
+
+try:
+    from model.src.checkpoint_utils import load_compatible_state_dict
+except ImportError:
+    from checkpoint_utils import load_compatible_state_dict
 
 # Define command-line flags
 FLAGS = flags.FLAGS
@@ -117,6 +118,7 @@ def load_model(
     config_path = model_path / "config.json"
     # Map model_type shortnames to full HuggingFace model identifiers
     model_type_defaults = {
+        "bert": "bert-base-cased",
         "distilbert": "distilbert-base-cased",
         "roberta": "roberta-base",
         "deberta-v2": "microsoft/deberta-v3-base",
@@ -174,14 +176,16 @@ def load_model(
                 model_weights_path, map_location="cpu", weights_only=False
             )
 
-        # Handle state dict that might have 'model.' prefix
-        if any(k.startswith("model.") for k in state_dict.keys()):
-            state_dict = {
-                k.replace("model.", ""): v
-                for k, v in state_dict.items()
-                if k.startswith("model.")
-            }
-        model.load_state_dict(state_dict, strict=False)
+        load_info = load_compatible_state_dict(
+            model,
+            state_dict,
+            source=str(model_weights_path),
+        )
+        if load_info.unexpected_keys:
+            logging.warning(
+                "⚠️  Ignoring unexpected checkpoint keys: %s",
+                load_info.unexpected_keys[:20],
+            )
         logging.info("✅ Model weights loaded")
     else:
         raise FileNotFoundError(f"Model weights not found in {model_path}")
@@ -351,6 +355,10 @@ def quantize_model(
     """
     logging.info("🔢 Quantizing model...")
 
+    import onnx
+    from optimum.onnxruntime import ORTQuantizer
+    from optimum.onnxruntime.configuration import AutoQuantizationConfig
+
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -418,9 +426,9 @@ def quantize_model(
 
 def main(argv):
     """
-    Orchestrates loading a trained multi-task PII detection model, exporting it to ONNX, optionally quantizing the ONNX model, signing and saving artifacts (tokenizer, label mappings, config), and handling errors.
+    Orchestrates loading a trained PII detection model, exporting it to ONNX, optionally quantizing the ONNX model, signing and saving artifacts (tokenizer, label mappings, config), and handling errors.
 
-    This function performs high-level orchestration for the CLI: it loads the trained model and tokenizer from FLAGS.model_path, exports the model to ONNX in FLAGS.output_path, signs the exported model, writes label mappings and (if present) the original config.json to the output directory, and — unless --skip_quantization is set — quantizes the ONNX model. On successful quantization the non-quantized ONNX file is removed. Any unhandled exception is logged and causes process exit with code 1.
+    This function performs high-level orchestration for the CLI: it loads the trained model and tokenizer from FLAGS.model_path, exports the model to ONNX in FLAGS.output_path, signs the exported model, writes label mappings and (if present) the original config.json to the output directory, and — unless --skip_quantization is set — writes a quantized side artifact. The non-quantized model.onnx remains the default production model. Any unhandled exception is logged and causes process exit with code 1.
 
     Parameters:
         argv: Ignored. Present to match the CLI entrypoint signature.
@@ -468,18 +476,10 @@ def main(argv):
         logging.info("✅ Quantization Complete!")
         logging.info("=" * 80)
         logging.info(f"Model saved to: {FLAGS.output_path}")
-        if FLAGS.skip_quantization:
-            logging.info(
-                f"saved non-quantized ONNX model: {output_path / 'model.onnx'}"
-            )
-        else:
-            os.remove(output_path / "model.onnx")
-            logging.info(
-                f"removed non-quantized ONNX model: {output_path / 'model.onnx'}"
-            )
+        logging.info(f"saved default ONNX model: {output_path / 'model.onnx'}")
         if not FLAGS.skip_quantization:
             logging.info(
-                f"saved quantized ONNX model: {output_path / 'model_quantized.onnx'}"
+                f"saved quantized side artifact: {output_path / 'model_quantized.onnx'}"
             )
 
     except Exception as e:

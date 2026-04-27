@@ -6,7 +6,6 @@ This script provides detailed, token-level outputs from the model including:
 2. Top-k predictions per token
 3. Raw logits and probabilities
 4. Detailed entity extraction breakdown
-5. Co-reference prediction details
 
 Usage:
     # Using local model:
@@ -40,9 +39,29 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 try:
-    from model.model import PIIDetectionModel
+    from model.src.model import PIIDetectionModel
 except ImportError:
-    from model import PIIDetectionModel
+    try:
+        from .model import PIIDetectionModel
+    except ImportError:
+        from model import PIIDetectionModel
+
+try:
+    from model.src.checkpoint_utils import (
+        load_compatible_state_dict,
+        normalize_state_dict_keys,
+    )
+except ImportError:
+    try:
+        from src.checkpoint_utils import (
+            load_compatible_state_dict,
+            normalize_state_dict_keys,
+        )
+    except ImportError:
+        from checkpoint_utils import (
+            load_compatible_state_dict,
+            normalize_state_dict_keys,
+        )
 
 
 # =============================================================================
@@ -66,7 +85,7 @@ def get_device():
 
 
 class DetailedPIIModelLoader:
-    """Loads and manages multi-task PII detection model with detailed output capabilities."""
+    """Loads and manages a PII detection model with detailed output capabilities."""
 
     def __init__(self, model_path: str):
         """
@@ -83,7 +102,7 @@ class DetailedPIIModelLoader:
         self.device = get_device()
 
     def load_model(self):
-        """Load multi-task model, tokenizer, and label mappings."""
+        """Load model, tokenizer, and label mappings."""
         logging.info(f"\n📥 Loading model from: {self.model_path}")
 
         # Load label mappings
@@ -108,16 +127,21 @@ class DetailedPIIModelLoader:
 
         # Load model config to get base model name
         config_path = Path(self.model_path) / "config.json"
+        model_type_defaults = {
+            "bert": "bert-base-cased",
+            "distilbert": "distilbert-base-cased",
+            "roberta": "roberta-base",
+            "deberta-v2": "microsoft/deberta-v3-base",
+        }
         if config_path.exists():
             with config_path.open() as f:
                 model_config = json.load(f)
-            # Try to get base model name from config
-            base_model_name = model_config.get("_name_or_path") or model_config.get(
-                "model_type", "distilbert"
-            )
-            # Convert model_type to full model name if needed
-            if base_model_name == "distilbert":
-                base_model_name = "distilbert-base-cased"
+            base_model_name = model_config.get("_name_or_path", "")
+            if not base_model_name or base_model_name in model_type_defaults:
+                model_type = model_config.get("model_type", "distilbert")
+                base_model_name = model_type_defaults.get(
+                    model_type, "microsoft/deberta-v3-base"
+                )
         else:
             base_model_name = "microsoft/deberta-v3-base"
             logging.warning(
@@ -155,13 +179,7 @@ class DetailedPIIModelLoader:
                     model_weights_path, map_location="cpu", weights_only=False
                 )
 
-            # Handle state dict that might have 'model.' prefix
-            if any(k.startswith("model.") for k in state_dict.keys()):
-                state_dict = {
-                    k.replace("model.", ""): v
-                    for k, v in state_dict.items()
-                    if k.startswith("model.")
-                }
+            state_dict = normalize_state_dict_keys(state_dict)
 
         logging.info("📋 Model configuration:")
         logging.info(f"   Base model: {base_model_name}")
@@ -188,15 +206,18 @@ class DetailedPIIModelLoader:
                 ) as f:
                     for key in f.keys():
                         state_dict[key] = f.get_tensor(key)
-                # Handle state dict that might have 'model.' prefix
-                if any(k.startswith("model.") for k in state_dict.keys()):
-                    state_dict = {
-                        k.replace("model.", ""): v
-                        for k, v in state_dict.items()
-                        if k.startswith("model.")
-                    }
+                state_dict = normalize_state_dict_keys(state_dict)
 
-            self.model.load_state_dict(state_dict, strict=False)
+            load_info = load_compatible_state_dict(
+                self.model,
+                state_dict,
+                source=str(model_weights_path),
+            )
+            if load_info.unexpected_keys:
+                logging.warning(
+                    "⚠️  Ignoring unexpected checkpoint keys: %s",
+                    load_info.unexpected_keys[:20],
+                )
             logging.info("✅ Model weights loaded")
         else:
             logging.warning(
@@ -228,11 +249,7 @@ class DetailedPIIModelLoader:
             - pii_predictions: List of predicted PII labels
             - pii_probabilities: List of probability distributions
             - pii_top_k: List of top-k predictions per token
-            - coref_predictions: List of predicted co-reference IDs
-            - coref_probabilities: List of probability distributions
-            - coref_top_k: List of top-k predictions per token
             - pii_logits: Raw logits for PII (if show_logits=True)
-            - coref_logits: Raw logits for co-reference (if show_logits=True)
             - offset_mapping: Token to character position mapping
             - inference_time_ms: Time taken for inference
         """
@@ -254,26 +271,30 @@ class DetailedPIIModelLoader:
         inputs.pop("token_type_ids", None)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Run inference with multi-task model
+        # Run inference
         with torch.no_grad():
             outputs = self.model(**inputs)
             # Get PII logits and predictions
             pii_logits = outputs["pii_logits"][0]  # [seq_len, num_labels]
-            pii_predictions = torch.argmax(pii_logits, dim=-1)  # [seq_len]
+            if hasattr(self.model, "decode"):
+                pii_prediction_ids = self.model.decode(
+                    outputs["pii_logits"], inputs["attention_mask"]
+                )[0]
+            else:
+                pii_prediction_ids = torch.argmax(pii_logits, dim=-1).cpu().tolist()
             pii_probs = F.softmax(pii_logits, dim=-1)  # [seq_len, num_labels]
-
-            # Get co-reference logits and predictions
-            coref_logits = outputs["coref_logits"][0]  # [seq_len, num_coref_labels]
-            coref_predictions = torch.argmax(coref_logits, dim=-1)  # [seq_len]
-            coref_probs = F.softmax(coref_logits, dim=-1)  # [seq_len, num_coref_labels]
 
         # Convert to lists
         tokens = self.tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+        if len(pii_prediction_ids) < len(tokens):
+            pii_prediction_ids = pii_prediction_ids + [0] * (
+                len(tokens) - len(pii_prediction_ids)
+            )
+        pii_prediction_ids = pii_prediction_ids[: len(tokens)]
         pii_pred_labels = [
-            self.pii_id2label.get(p.item(), "O") for p in pii_predictions
+            self.pii_id2label.get(int(label_id), "O") for label_id in pii_prediction_ids
         ]
-        pii_pred_ids = [p.item() for p in pii_predictions]
-        coref_pred_ids = [p.item() for p in coref_predictions]
+        pii_pred_ids = [int(label_id) for label_id in pii_prediction_ids]
 
         # Get top-k predictions for PII
         pii_top_k_list = []
@@ -291,27 +312,8 @@ class DetailedPIIModelLoader:
             ]
             pii_top_k_list.append(top_k_items)
 
-        # Get top-k predictions for co-reference
-        coref_top_k_list = []
-        for i in range(len(tokens)):
-            top_k_probs, top_k_indices = torch.topk(
-                coref_probs[i], k=min(top_k, len(self.coref_id2label))
-            )
-            top_k_items = [
-                {
-                    "label": self.coref_id2label.get(
-                        idx.item(), f"CLUSTER_{idx.item()}"
-                    ),
-                    "label_id": idx.item(),
-                    "probability": prob.item(),
-                }
-                for prob, idx in zip(top_k_probs, top_k_indices, strict=True)
-            ]
-            coref_top_k_list.append(top_k_items)
-
         # Convert probabilities to lists
         pii_prob_list = [probs.cpu().tolist() for probs in pii_probs]
-        coref_prob_list = [probs.cpu().tolist() for probs in coref_probs]
 
         end_time = time.perf_counter()
         inference_time_ms = (end_time - start_time) * 1000
@@ -322,16 +324,12 @@ class DetailedPIIModelLoader:
             "pii_pred_ids": pii_pred_ids,
             "pii_probabilities": pii_prob_list,
             "pii_top_k": pii_top_k_list,
-            "coref_predictions": coref_pred_ids,
-            "coref_probabilities": coref_prob_list,
-            "coref_top_k": coref_top_k_list,
             "offset_mapping": offset_mapping.cpu().tolist(),
             "inference_time_ms": inference_time_ms,
         }
 
         if show_logits:
             result["pii_logits"] = pii_logits.cpu().tolist()
-            result["coref_logits"] = coref_logits.cpu().tolist()
 
         return result
 
@@ -360,7 +358,6 @@ def print_detailed_results(
     case_num: int,
     top_k: int = 3,
     show_logits: bool = False,
-    coref_id2label: dict[int, str] | None = None,
     pii_id2label: dict[int, str] | None = None,
 ):
     """
@@ -372,13 +369,10 @@ def print_detailed_results(
         case_num: Test case number
         top_k: Number of top predictions to show
         show_logits: Whether to show raw logits
-        coref_id2label: Optional mapping from cluster ID to label name
     """
     tokens = detailed_output["tokens"]
     pii_preds = detailed_output["pii_predictions"]
     pii_top_k = detailed_output["pii_top_k"]
-    coref_preds = detailed_output["coref_predictions"]
-    coref_top_k = detailed_output["coref_top_k"]
     inference_time = detailed_output["inference_time_ms"]
 
     logging.info(f"\n{'=' * 80}")
@@ -392,14 +386,10 @@ def print_detailed_results(
     logging.info(f"\n{'=' * 80}")
     logging.info("Token-by-Token Predictions")
     logging.info(f"{'=' * 80}")
-    logging.info(
-        f"{'Token':<20} {'PII Label':<20} {'PII Conf':<10} {'Coref':<15} {'Coref Conf':<10}"
-    )
-    logging.info("-" * 80)
+    logging.info(f"{'Token':<20} {'PII Label':<20} {'PII Conf':<10}")
+    logging.info("-" * 56)
 
-    for i, (token, pii_label, coref_id) in enumerate(
-        zip(tokens, pii_preds, coref_preds, strict=True)
-    ):
+    for i, (token, pii_label) in enumerate(zip(tokens, pii_preds, strict=True)):
         # Skip special tokens in main display
         if token in ["[CLS]", "[SEP]", "[PAD]"]:
             continue
@@ -408,20 +398,11 @@ def print_detailed_results(
         pii_conf = detailed_output["pii_probabilities"][i][
             detailed_output["pii_pred_ids"][i]
         ]
-        coref_conf = detailed_output["coref_probabilities"][i][coref_id]
-
-        # Get coref label
-        if coref_id2label and coref_id in coref_id2label:
-            coref_label = coref_id2label[coref_id]
-        else:
-            coref_label = f"CLUSTER_{coref_id}" if coref_id > 0 else "NO_COREF"
 
         # Truncate token if too long
         token_display = token[:18] + ".." if len(token) > 20 else token
 
-        logging.info(
-            f"{token_display:<20} {pii_label:<20} {pii_conf:.4f}     {coref_label:<15} {coref_conf:.4f}"
-        )
+        logging.info(f"{token_display:<20} {pii_label:<20} {pii_conf:.4f}")
 
     # Top-k predictions per token
     logging.info(f"\n{'=' * 80}")
@@ -440,25 +421,6 @@ def print_detailed_results(
                 f"Probability: {item['probability']:.4f}"
             )
 
-    # Co-reference top-k
-    logging.info(f"\n{'=' * 80}")
-    logging.info(f"Top-{top_k} Co-reference Predictions Per Token")
-    logging.info(f"{'=' * 80}")
-
-    for i, (token, top_k_items) in enumerate(zip(tokens, coref_top_k, strict=True)):
-        # Skip special tokens and NO_COREF predictions
-        if token in ["[CLS]", "[SEP]", "[PAD]"]:
-            continue
-
-        # Only show if there are interesting predictions
-        if any(item["label_id"] > 0 for item in top_k_items):
-            logging.info(f"\nToken {i}: '{token}'")
-            for rank, item in enumerate(top_k_items, 1):
-                logging.info(
-                    f"  {rank}. {item['label']:<15} (ID: {item['label_id']:3d}) "
-                    f"Probability: {item['probability']:.4f}"
-                )
-
     # Show raw logits if requested
     if show_logits:
         logging.info(f"\n{'=' * 80}")
@@ -466,7 +428,6 @@ def print_detailed_results(
         logging.info(f"{'=' * 80}")
 
         pii_logits = detailed_output.get("pii_logits", [])
-        coref_logits = detailed_output.get("coref_logits", [])
 
         if pii_logits and pii_id2label:
             logging.info("\nPII Logits (sample):")
@@ -480,20 +441,6 @@ def print_detailed_results(
                             logit_val = pii_logits[i][label_id]
                             logging.info(f"  {label_name:<20} logit: {logit_val:.4f}")
 
-        if coref_logits:
-            logging.info("\nCo-reference Logits (sample):")
-            for i in range(min(10, len(tokens))):
-                if tokens[i] not in ["[CLS]", "[SEP]", "[PAD]"]:
-                    logging.info(f"\nToken {i} '{tokens[i]}':")
-                    for label_id in range(min(10, len(coref_logits[i]))):
-                        logit_val = coref_logits[i][label_id]
-                        label_name = (
-                            coref_id2label.get(label_id, f"CLUSTER_{label_id}")
-                            if coref_id2label
-                            else f"CLUSTER_{label_id}"
-                        )
-                        logging.info(f"  {label_name:<15} logit: {logit_val:.4f}")
-
     # Summary statistics
     logging.info(f"\n{'=' * 80}")
     logging.info("Summary Statistics")
@@ -502,10 +449,6 @@ def print_detailed_results(
     # Count entities
     pii_entities = sum(1 for label in pii_preds if label.startswith("B-"))
     logging.info(f"PII entities detected: {pii_entities}")
-
-    # Count co-reference clusters
-    coref_clusters = set(coref_preds) - {0}
-    logging.info(f"Co-reference clusters: {len(coref_clusters)}")
 
     # Average confidence
     valid_tokens = [
@@ -516,12 +459,7 @@ def print_detailed_results(
             detailed_output["pii_probabilities"][i][detailed_output["pii_pred_ids"][i]]
             for i in valid_tokens
         ) / len(valid_tokens)
-        avg_coref_conf = sum(
-            detailed_output["coref_probabilities"][i][coref_preds[i]]
-            for i in valid_tokens
-        ) / len(valid_tokens)
         logging.info(f"Average PII confidence: {avg_pii_conf:.4f}")
-        logging.info(f"Average co-reference confidence: {avg_coref_conf:.4f}")
 
     logging.info(f"{'=' * 80}\n")
 
@@ -611,7 +549,6 @@ def main():
             i,
             top_k=args.top_k,
             show_logits=args.show_logits,
-            coref_id2label=loader.coref_id2label,
             pii_id2label=loader.pii_id2label,
         )
 
