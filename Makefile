@@ -247,7 +247,7 @@ setup-tokenizers: ## Download pre-built tokenizers library for development
 	@if [ -f "build/tokenizers/libtokenizers.a" ]; then \
 		echo "$(GREEN)✅ Tokenizers library already exists$(NC)"; \
 	else \
-		TOKENIZERS_VERSION=$$(awk '/github.com\/daulet\/tokenizers/ { sub(/^v/, "", $$2); print $$2; exit }' go.mod); \
+		TOKENIZERS_VERSION=$$(go list -m -f '{{.Version}}' github.com/daulet/tokenizers | sed 's/^v//'); \
 		if [ "$$(uname)" = "Darwin" ]; then \
 			ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/arm64/aarch64/'); \
 			PLATFORM="darwin-$$ARCH"; \
