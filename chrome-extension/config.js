@@ -1,4 +1,4 @@
-// Kiji Guard Extension - Shared Configuration
+// Kiji Privacy Proxy Extension - Shared Configuration
 "use strict";
 
 const CONFIG = {
@@ -12,7 +12,8 @@ const CONFIG = {
     "https://huggingface.co/chat/*",
     "https://chat.mistral.ai/*",
     "https://poe.com/*",
+    "https://www.perplexity.ai/*",
   ],
   HEALTH_CHECK_INTERVAL_MS: 30000,
-  CONTENT_SCRIPT_ID: "kiji-pii-guard",
+  CONTENT_SCRIPT_ID: "kiji-privacy-proxy",
 };

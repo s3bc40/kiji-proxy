@@ -1,10 +1,28 @@
 {
   "manifest_version": 3,
-  "name": "Kiji Guard Extension",
-  "version": "1.2.0",
+  "name": "Kiji Privacy Proxy Extension",
+  "version": "1.0.0",
   "description": "Checks for PII before submitting text to AI chat services",
-  "permissions": ["activeTab", "storage", "scripting"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*",
+    "https://huggingface.co/chat/*",
+    "https://chat.mistral.ai/*",
+    "https://poe.com/*",
+    "https://www.perplexity.ai/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

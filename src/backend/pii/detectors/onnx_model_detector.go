@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -31,6 +32,14 @@ type tokenChunk struct {
 	isLast          bool // Is this the last chunk?
 }
 
+// crfParams holds the CRF transition matrices exported during quantization.
+// These are used by Viterbi decoding to enforce valid BIO label sequences.
+type crfParams struct {
+	Transitions      [][]float32 `json:"transitions"`       // [num_labels][num_labels]
+	StartTransitions []float32   `json:"start_transitions"` // [num_labels]
+	EndTransitions   []float32   `json:"end_transitions"`   // [num_labels]
+}
+
 // ONNXModelDetectorSimple implements DetectorClass using an internal ONNX model
 type ONNXModelDetectorSimple struct {
 	tokenizer                 *tokenizers.Tokenizer
@@ -44,6 +53,7 @@ type ONNXModelDetectorSimple struct {
 	numPIILabels              int
 	modelPath                 string
 	entityConfidenceThreshold float64
+	crf                       *crfParams // nil if crf_transitions.json not found
 }
 
 // NewONNXModelDetectorSimple creates a new ONNX model detector
@@ -61,14 +71,14 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 	if onnxLibPath == "" {
 		onnxPaths := []string{
 			// macOS paths (.dylib)
-			"./libonnxruntime.1.24.2.dylib",            // CWD (legacy)
-			"./resources/libonnxruntime.1.24.2.dylib",  // Production DMG: CWD is Contents/Resources
-			"./build/libonnxruntime.1.24.2.dylib",      // Development: in build directory
-			"../libonnxruntime.1.24.2.dylib",           // Alternative location
+			"./libonnxruntime.1.24.2.dylib",           // CWD (legacy)
+			"./resources/libonnxruntime.1.24.2.dylib", // Production DMG: CWD is Contents/Resources
+			"./build/libonnxruntime.1.24.2.dylib",     // Development: in build directory
+			"../libonnxruntime.1.24.2.dylib",          // Alternative location
 			// Linux paths (.so)
-			"./lib/libonnxruntime.so.1.24.2",           // Linux release tarball layout
-			"./build/libonnxruntime.so.1.24.2",         // Development: in build directory
-			"./libonnxruntime.so.1.24.2",               // CWD
+			"./lib/libonnxruntime.so.1.24.2",   // Linux release tarball layout
+			"./build/libonnxruntime.so.1.24.2", // Development: in build directory
+			"./libonnxruntime.so.1.24.2",       // CWD
 		}
 
 		for _, p := range onnxPaths {
@@ -108,7 +118,11 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 
 	// Load model configuration
 	// Try multiple possible locations for the config file
+	modelDir := filepath.Dir(modelPath)
+	tokenizerDir := filepath.Dir(tokenizerPath)
 	configPaths := []string{
+		filepath.Join(modelDir, "label_mappings.json"),
+		filepath.Join(tokenizerDir, "label_mappings.json"),
 		"model/quantized/label_mappings.json", // Default location
 		"quantized/label_mappings.json",       // Alternative: in resources/quantized
 		"./label_mappings.json",               // Alternative: current directory
@@ -169,6 +183,35 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 	}
 	fmt.Printf("Loaded %d PII labels (expected 49)\n", numPIILabels)
 
+	// Load CRF transition parameters for Viterbi decoding.
+	// The CRF layer is part of the trained model but not exported to ONNX;
+	// instead the transition matrices are saved as a sidecar JSON file.
+	var crf *crfParams
+	crfPaths := []string{
+		filepath.Join(modelDir, "crf_transitions.json"),
+		filepath.Join(tokenizerDir, "crf_transitions.json"),
+		"model/quantized/crf_transitions.json",
+		"quantized/crf_transitions.json",
+		"./crf_transitions.json",
+	}
+	for _, path := range crfPaths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var c crfParams
+		if err := json.Unmarshal(data, &c); err != nil {
+			fmt.Printf("Warning: failed to parse CRF transitions from %s: %v\n", path, err)
+			continue
+		}
+		crf = &c
+		fmt.Printf("Loaded CRF transition parameters from %s (%d labels)\n", path, len(c.StartTransitions))
+		break
+	}
+	if crf == nil {
+		fmt.Println("Warning: CRF transitions not found, falling back to argmax decoding")
+	}
+
 	detector := &ONNXModelDetectorSimple{
 		tokenizer:                 tk,
 		id2label:                  config.PII.ID2Label,
@@ -177,6 +220,7 @@ func NewONNXModelDetectorSimple(modelPath string, tokenizerPath string) (*ONNXMo
 		numPIILabels:              numPIILabels,
 		modelPath:                 modelPath,
 		entityConfidenceThreshold: defaultEntityConfidenceThreshold,
+		crf:                       crf,
 	}
 
 	// Initialize tensors and session will be done on first use
@@ -280,10 +324,266 @@ func (d *ONNXModelDetectorSimple) classifyToken(tokenLogits []float32) (string, 
 	return label, confidence
 }
 
+// viterbiDecode runs the Viterbi algorithm over a sequence of emission scores
+// using the CRF transition matrices to find the globally optimal label sequence.
+func viterbiDecode(emissions []float32, numLabels int, crf *crfParams) []int {
+	seqLen := len(emissions) / numLabels
+	if seqLen == 0 || numLabels == 0 {
+		return nil
+	}
+	if len(emissions) < seqLen*numLabels {
+		return nil
+	}
+
+	// viterbi[t*numLabels + j] = best score ending in label j at position t
+	viterbi := make([]float64, seqLen*numLabels)
+	backpointers := make([]int, seqLen*numLabels)
+
+	// Initialization: viterbi[0][j] = start_transitions[j] + emissions[0][j]
+	for j := 0; j < numLabels; j++ {
+		viterbi[j] = float64(crf.StartTransitions[j]) + float64(emissions[j]) // #nosec G602 - j < numLabels <= len(emissions) checked above
+	}
+
+	// Forward pass
+	for t := 1; t < seqLen; t++ {
+		for j := 0; j < numLabels; j++ {
+			bestScore := math.Inf(-1)
+			bestPrev := 0
+			emissionScore := float64(emissions[t*numLabels+j])
+			for k := 0; k < numLabels; k++ {
+				score := viterbi[(t-1)*numLabels+k] + float64(crf.Transitions[k][j]) + emissionScore
+				if score > bestScore {
+					bestScore = score
+					bestPrev = k
+				}
+			}
+			viterbi[t*numLabels+j] = bestScore
+			backpointers[t*numLabels+j] = bestPrev
+		}
+	}
+
+	// Add end transitions and find best last label
+	bestScore := math.Inf(-1)
+	bestLast := 0
+	for j := 0; j < numLabels; j++ {
+		score := viterbi[(seqLen-1)*numLabels+j] + float64(crf.EndTransitions[j])
+		if score > bestScore {
+			bestScore = score
+			bestLast = j
+		}
+	}
+
+	// Backtrace
+	path := make([]int, seqLen)
+	path[seqLen-1] = bestLast
+	for t := seqLen - 1; t > 0; t-- {
+		path[t-1] = backpointers[t*numLabels+path[t]]
+	}
+
+	return path
+}
+
+// softmaxConfidence computes the softmax probability for a specific class given its logits.
+func softmaxConfidence(tokenLogits []float32, classIdx int) float64 {
+	maxLogit := float64(tokenLogits[0])
+	for _, l := range tokenLogits[1:] {
+		if float64(l) > maxLogit {
+			maxLogit = float64(l)
+		}
+	}
+	var sum float64
+	for _, l := range tokenLogits {
+		sum += math.Exp(float64(l) - maxLogit)
+	}
+	return math.Exp(float64(tokenLogits[classIdx])-maxLogit) / sum
+}
+
+func splitBIOLabel(label string) (baseLabel string, isBeginning bool, isInside bool) {
+	isBeginning = strings.HasPrefix(label, "B-")
+	isInside = strings.HasPrefix(label, "I-")
+	if isBeginning || isInside {
+		return strings.TrimPrefix(strings.TrimPrefix(label, "B-"), "I-"), isBeginning, isInside
+	}
+	return label, false, false
+}
+
+func isEntityJoinerToken(tokenText string) bool {
+	trimmed := strings.TrimSpace(tokenText)
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		if !strings.ContainsRune(".,@_-+:/#%&=", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func tokenStartsAtPreviousEnd(tokenIndex int, currentTokens []int, offsets []tokenizers.Offset) bool {
+	if len(currentTokens) == 0 || tokenIndex >= len(offsets) {
+		return false
+	}
+	previousTokenIndex := currentTokens[len(currentTokens)-1]
+	if previousTokenIndex >= len(offsets) {
+		return false
+	}
+	return offsets[previousTokenIndex][1] == offsets[tokenIndex][0]
+}
+
+func tokenTextAt(originalText string, offsets []tokenizers.Offset, index int) string {
+	if index >= len(offsets) || offsets[index][0] >= uint(len(originalText)) || offsets[index][1] > uint(len(originalText)) {
+		return ""
+	}
+	return originalText[offsets[index][0]:offsets[index][1]]
+}
+
+func (d *ONNXModelDetectorSimple) decodedTokenLabel(index int, outputData []float32, bestLabels []int) (string, float64) {
+	startIdx := index * d.numPIILabels
+	endIdx := (index + 1) * d.numPIILabels
+	if startIdx < 0 || endIdx > len(outputData) {
+		return "O", 0
+	}
+
+	tokenLogits := outputData[startIdx:endIdx]
+	if bestLabels != nil && index < len(bestLabels) {
+		classID := bestLabels[index]
+		idStr := fmt.Sprintf("%d", classID)
+		label, ok := d.id2label[idStr]
+		if !ok {
+			label = "O"
+		}
+		return label, softmaxConfidence(tokenLogits, classID)
+	}
+
+	return d.classifyToken(tokenLogits)
+}
+
+type decodedEntityToken struct {
+	index       int
+	tokenID     uint32
+	text        string
+	label       string
+	baseLabel   string
+	confidence  float64
+	isBeginning bool
+	isInside    bool
+}
+
+func (d *ONNXModelDetectorSimple) decodeEntityToken(
+	index int,
+	tokenID uint32,
+	originalText string,
+	offsets []tokenizers.Offset,
+	outputData []float32,
+	bestLabels []int,
+	currentEntity *Entity,
+) decodedEntityToken {
+	label, confidence := d.decodedTokenLabel(index, outputData, bestLabels)
+	tokenText := tokenTextAt(originalText, offsets, index)
+
+	if confidence < d.entityConfidenceThreshold {
+		label = "O"
+	}
+	label, confidence = d.bridgeJoinerToken(index, tokenText, label, confidence, outputData, bestLabels, currentEntity)
+
+	baseLabel, isBeginning, isInside := splitBIOLabel(label)
+	return decodedEntityToken{
+		index:       index,
+		tokenID:     tokenID,
+		text:        tokenText,
+		label:       label,
+		baseLabel:   baseLabel,
+		confidence:  confidence,
+		isBeginning: isBeginning,
+		isInside:    isInside,
+	}
+}
+
+func (d *ONNXModelDetectorSimple) bridgeJoinerToken(
+	index int,
+	tokenText string,
+	label string,
+	confidence float64,
+	outputData []float32,
+	bestLabels []int,
+	currentEntity *Entity,
+) (string, float64) {
+	if label != "O" || currentEntity == nil || !isEntityJoinerToken(tokenText) {
+		return label, confidence
+	}
+
+	nextLabel, nextConfidence := d.decodedTokenLabel(index+1, outputData, bestLabels)
+	nextBaseLabel, nextIsBeginning, nextIsInside := splitBIOLabel(nextLabel)
+	if nextConfidence >= d.entityConfidenceThreshold &&
+		(nextIsBeginning || nextIsInside) &&
+		nextBaseLabel == currentEntity.Label {
+		return "I-" + currentEntity.Label, currentEntity.Confidence
+	}
+
+	return label, confidence
+}
+
+type entityGroupingState struct {
+	currentEntity *Entity
+	currentTokens []int
+	entities      []Entity
+}
+
+func (s *entityGroupingState) consume(
+	d *ONNXModelDetectorSimple,
+	token decodedEntityToken,
+	originalText string,
+	offsets []tokenizers.Offset,
+) {
+	isSameCompactEntity := token.label != "O" &&
+		s.currentEntity != nil &&
+		s.currentEntity.Label == token.baseLabel &&
+		tokenStartsAtPreviousEnd(token.index, s.currentTokens, offsets)
+
+	switch {
+	case token.label != "O" && s.currentEntity != nil && s.currentEntity.Label == token.baseLabel && (token.isInside || isSameCompactEntity):
+		// Continue current entity. Same-label B tags immediately after a
+		// joiner token are treated as continuation so emails like
+		// "jonathan.reyes@example.com" do not fragment.
+		s.currentTokens = append(s.currentTokens, token.index)
+		s.currentEntity.Confidence = (s.currentEntity.Confidence + token.confidence) / 2
+	case token.label != "O" && (token.isBeginning || s.currentEntity == nil):
+		s.finishCurrent(d, originalText, offsets)
+		s.currentEntity = &Entity{
+			Label:      token.baseLabel,
+			Confidence: token.confidence,
+		}
+		s.currentTokens = []int{token.index}
+	default:
+		s.finishCurrent(d, originalText, offsets)
+	}
+}
+
+func (s *entityGroupingState) finishCurrent(d *ONNXModelDetectorSimple, originalText string, offsets []tokenizers.Offset) {
+	if s.currentEntity == nil {
+		return
+	}
+
+	d.finalizeEntity(s.currentEntity, s.currentTokens, originalText, offsets)
+	s.entities = append(s.entities, *s.currentEntity)
+	s.currentEntity = nil
+	s.currentTokens = nil
+}
+
+func filterEmptyEntities(entities []Entity) []Entity {
+	filtered := entities[:0]
+	for _, e := range entities {
+		if e.Text != "" {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
 // processOutputInline converts model output to entities (inline to avoid compilation issues)
 func (d *ONNXModelDetectorSimple) processOutputInline(originalText string, tokenIDs []uint32, offsets []tokenizers.Offset) []Entity {
 	outputData := d.outputTensor.GetData()
-	entities := []Entity{}
 
 	// Ensure we don't process more tokens than we have
 	numTokens := len(tokenIDs)
@@ -293,9 +593,14 @@ func (d *ONNXModelDetectorSimple) processOutputInline(originalText string, token
 
 	fmt.Printf("[ONNX Model Response] Processing %d tokens, output tensor size: %d, numPIILabels: %d\n", numTokens, len(outputData), d.numPIILabels)
 
+	// Decode label sequence: use Viterbi if CRF params available, otherwise argmax
+	var bestLabels []int
+	if d.crf != nil && numTokens*d.numPIILabels <= len(outputData) {
+		bestLabels = viterbiDecode(outputData[:numTokens*d.numPIILabels], d.numPIILabels, d.crf)
+	}
+
 	// Group consecutive tokens with same label (B-PREFIX, I-PREFIX pattern)
-	var currentEntity *Entity
-	var currentTokens []int
+	state := entityGroupingState{}
 
 	// Process each token
 	for i := 0; i < numTokens; i++ {
@@ -306,105 +611,19 @@ func (d *ONNXModelDetectorSimple) processOutputInline(originalText string, token
 			fmt.Printf("[ONNX Model Response] Token %d: out of bounds (startIdx=%d, endIdx=%d, outputLen=%d)\n", i, startIdx, endIdx, len(outputData))
 			break // Reached end of output data
 		}
-		tokenLogits := outputData[startIdx:endIdx]
 
-		// Classify this token
-		label, confidence := d.classifyToken(tokenLogits)
-
-		// Log token details
-		tokenText := ""
-		if i < len(offsets) && offsets[i][0] < uint(len(originalText)) && offsets[i][1] <= uint(len(originalText)) {
-			tokenText = originalText[offsets[i][0]:offsets[i][1]]
-		}
+		token := d.decodeEntityToken(i, tokenIDs[i], originalText, offsets, outputData, bestLabels, state.currentEntity)
 		fmt.Printf("[ONNX Model Response] Token %d: id=%d text=%q offset=(%d,%d) label=%q confidence=%.4f\n",
-			i, tokenIDs[i], tokenText, offsets[i][0], offsets[i][1], label, confidence)
+			i, token.tokenID, token.text, offsets[i][0], offsets[i][1], token.label, token.confidence)
 
-		// Log top-3 predictions for non-O tokens to help debug misclassifications
-		if label != "O" || confidence < 0.8 {
-			type logitEntry struct {
-				classID int
-				label   string
-				logit   float32
-			}
-			var top []logitEntry
-			for j, logit := range tokenLogits {
-				cID := fmt.Sprintf("%d", j)
-				cLabel, ok := d.id2label[cID]
-				if !ok {
-					cLabel = fmt.Sprintf("UNKNOWN_%d", j)
-				}
-				top = append(top, logitEntry{j, cLabel, logit})
-			}
-			sort.Slice(top, func(a, b int) bool { return top[a].logit > top[b].logit })
-			n := 3
-			if len(top) < n {
-				n = len(top)
-			}
-			fmt.Printf("[ONNX Model Response]   Top-%d predictions: ", n)
-			for k := 0; k < n; k++ {
-				fmt.Printf("%s(id=%d logit=%.4f) ", top[k].label, top[k].classID, top[k].logit)
-			}
-			fmt.Println()
-		}
-
-		// Only process tokens with reasonable confidence
-		if confidence < d.entityConfidenceThreshold {
-			label = "O"
-		}
-
-		// Handle B-PREFIX (beginning) and I-PREFIX (inside) labels
-		isBeginning := strings.HasPrefix(label, "B-")
-		isInside := strings.HasPrefix(label, "I-")
-		baseLabel := label
-		if isBeginning || isInside {
-			baseLabel = strings.TrimPrefix(strings.TrimPrefix(label, "B-"), "I-")
-		}
-
-		// Handle different entity states using switch for better readability
-		switch {
-		case label != "O" && (isBeginning || currentEntity == nil):
-			// Finish previous entity if exists
-			if currentEntity != nil {
-				d.finalizeEntity(currentEntity, currentTokens, originalText, offsets)
-				entities = append(entities, *currentEntity)
-			}
-
-			// Start new entity
-			currentEntity = &Entity{
-				Label:      baseLabel,
-				Confidence: confidence,
-			}
-			currentTokens = []int{i}
-		case label != "O" && isInside && currentEntity != nil && currentEntity.Label == baseLabel:
-			// Continue current entity
-			currentTokens = append(currentTokens, i)
-			// Update confidence to average
-			currentEntity.Confidence = (currentEntity.Confidence + confidence) / 2
-		default:
-			// Finish current entity if exists
-			if currentEntity != nil {
-				d.finalizeEntity(currentEntity, currentTokens, originalText, offsets)
-				entities = append(entities, *currentEntity)
-				currentEntity = nil
-				currentTokens = nil
-			}
-		}
+		state.consume(d, token, originalText, offsets)
 	}
 
 	// Finish last entity if exists
-	if currentEntity != nil {
-		d.finalizeEntity(currentEntity, currentTokens, originalText, offsets)
-		entities = append(entities, *currentEntity)
-	}
+	state.finishCurrent(d, originalText, offsets)
 
 	// Filter out entities with empty text (e.g. from special tokens like [CLS]/[SEP])
-	filtered := entities[:0]
-	for _, e := range entities {
-		if e.Text != "" {
-			filtered = append(filtered, e)
-		}
-	}
-	entities = filtered
+	entities := filterEmptyEntities(state.entities)
 
 	fmt.Printf("[ONNX Model Response] Extracted %d entities from chunk:\n", len(entities))
 	for i, e := range entities {
@@ -437,6 +656,15 @@ func (d *ONNXModelDetectorSimple) finalizeEntity(entity *Entity, tokenIndices []
 		trimmedStart++
 	}
 	for trimmedEnd > trimmedStart && (originalText[trimmedEnd-1] == ' ' || originalText[trimmedEnd-1] == '\t' || originalText[trimmedEnd-1] == '\n' || originalText[trimmedEnd-1] == '\r') {
+		trimmedEnd--
+	}
+	// Strip trailing sentence punctuation only when followed by whitespace
+	// or end-of-string, so "yahoo.com" keeps the dot but "1988," loses
+	// the trailing comma.
+	for trimmedEnd > trimmedStart && (originalText[trimmedEnd-1] == ',' || originalText[trimmedEnd-1] == '.' || originalText[trimmedEnd-1] == ';' || originalText[trimmedEnd-1] == ':' || originalText[trimmedEnd-1] == '!' || originalText[trimmedEnd-1] == '?') {
+		if trimmedEnd < uint(len(originalText)) && originalText[trimmedEnd] != ' ' && originalText[trimmedEnd] != '\t' && originalText[trimmedEnd] != '\n' && originalText[trimmedEnd] != '\r' {
+			break
+		}
 		trimmedEnd--
 	}
 	if trimmedStart < trimmedEnd {

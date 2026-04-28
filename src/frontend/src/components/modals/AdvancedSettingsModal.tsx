@@ -35,14 +35,6 @@ export default function AdvancedSettingsModal({
   const [entityConfidence, setEntityConfidence] = useState(0.25);
   const [confidenceSaved, setConfidenceSaved] = useState(false);
 
-  useEffect(() => {
-    if (isOpen && isElectron) {
-      loadModelInfo();
-      loadTransparentProxySetting();
-      loadEntityConfidence();
-    }
-  }, [isOpen]);
-
   const loadTransparentProxySetting = async () => {
     if (!window.electronAPI) return;
 
@@ -64,6 +56,33 @@ export default function AdvancedSettingsModal({
       console.error("Error loading entity confidence:", error);
     }
   };
+
+  const loadModelInfo = async () => {
+    if (!window.electronAPI) return;
+
+    try {
+      const [storedDir, info] = await Promise.all([
+        window.electronAPI.getModelDirectory(),
+        window.electronAPI.getModelInfo(),
+      ]);
+
+      setHasModelDirectory(!!storedDir);
+      setModelDirectory(storedDir || "");
+      setModelInfo(info);
+    } catch (error) {
+      console.error("Error loading model info:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen && isElectron) {
+      /* eslint-disable react-hooks/set-state-in-effect */
+      loadModelInfo();
+      loadTransparentProxySetting();
+      loadEntityConfidence();
+      /* eslint-enable react-hooks/set-state-in-effect */
+    }
+  }, [isOpen]);
 
   const handleSetEntityConfidence = async (confidence: number) => {
     if (!window.electronAPI) return;
@@ -100,23 +119,6 @@ export default function AdvancedSettingsModal({
       console.error("Error toggling transparent proxy:", error);
     } finally {
       setIsTogglingProxy(false);
-    }
-  };
-
-  const loadModelInfo = async () => {
-    if (!window.electronAPI) return;
-
-    try {
-      const [storedDir, info] = await Promise.all([
-        window.electronAPI.getModelDirectory(),
-        window.electronAPI.getModelInfo(),
-      ]);
-
-      setHasModelDirectory(!!storedDir);
-      setModelDirectory(storedDir || "");
-      setModelInfo(info);
-    } catch (error) {
-      console.error("Error loading model info:", error);
     }
   };
 
@@ -360,7 +362,7 @@ export default function AdvancedSettingsModal({
             </div>
 
             <p className="text-xs text-slate-500 mt-1">
-              Directory must contain: model_quantized.onnx, tokenizer.json,
+              Directory must contain: model.onnx, tokenizer.json,
               label_mappings.json
             </p>
 

@@ -1,6 +1,6 @@
 """Tokenization utilities for training samples."""
 
-import re
+import logging
 from typing import Any
 
 from transformers import AutoTokenizer
@@ -18,6 +18,38 @@ class TokenizationProcessor:
         self.tokenizer = tokenizer
         self.label2id = label2id
         self.id2label = id2label
+
+    def _drop_overlapping_positions(
+        self, positions: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Drop overlapping spans before string replacement.
+
+        A single token can only have one BIO label. If the source annotations contain
+        nested or overlapping spans, keep the longest span and drop the shorter one
+        so label replacement cannot corrupt neighboring text.
+        """
+        kept: list[dict[str, Any]] = []
+        dropped = 0
+
+        for item in sorted(
+            positions,
+            key=lambda x: (-(x["end"] - x["start"]), x["start"], x["label"]),
+        ):
+            overlaps_kept = any(
+                item["start"] < kept_item["end"] and kept_item["start"] < item["end"]
+                for kept_item in kept
+            )
+            if overlaps_kept:
+                dropped += 1
+                continue
+            kept.append(item)
+
+        if dropped:
+            logging.getLogger(__name__).debug(
+                "Dropped %d overlapping privacy-mask span(s)", dropped
+            )
+
+        return sorted(kept, key=lambda x: x["start"], reverse=True)
 
     def _find_privacy_mask_positions(
         self, text: str, privacy_mask: list[dict[str, str]]
@@ -41,8 +73,6 @@ class TokenizationProcessor:
                 # Validate that the offset matches the expected value
                 actual = text[entry["start"] : entry["end"]]
                 if actual != entry["value"]:
-                    import logging
-
                     logging.getLogger(__name__).debug(
                         "Offset mismatch: expected '%s' but found '%s' at [%d:%d]",
                         entry["value"],
@@ -58,47 +88,7 @@ class TokenizationProcessor:
                 )
 
         # Sort by start position (reverse order for replacement)
-        return sorted(
-            privacy_mask_with_positions, key=lambda x: x["start"], reverse=True
-        )
-
-    def _create_word_labels(
-        self, text: str, privacy_mask_with_positions: list[dict[str, Any]]
-    ) -> list[str]:
-        """Create word-level labels from privacy mask positions."""
-        # Replace sensitive text with label placeholders
-        text_with_labels = text
-        for item in privacy_mask_with_positions:
-            label = item["label"]
-            start = item["start"]
-            end = item["end"]
-            value = item["value"]
-
-            # Count words in the sensitive value
-            word_count = len(value.split())
-
-            # Replace with appropriate number of label placeholders
-            replacement = " ".join([label] * word_count)
-            text_with_labels = (
-                text_with_labels[:start] + replacement + text_with_labels[end:]
-            )
-
-        # Split into words and assign labels
-        words = text_with_labels.split()
-        word_labels = []
-        for word in words:
-            match = re.search(r"(\w+)", word)
-            if match:
-                label = match.group(1)
-                # Check if it's a valid PII label (all uppercase, not "O")
-                if label.isupper() and label != "O":
-                    word_labels.append(label)
-                else:
-                    word_labels.append("O")
-            else:
-                word_labels.append("O")
-
-        return word_labels
+        return self._drop_overlapping_positions(privacy_mask_with_positions)
 
     def _is_punctuation_only(self, token_text: str) -> bool:
         """Check if a token contains only punctuation characters."""
@@ -108,89 +98,115 @@ class TokenizationProcessor:
         punctuation_chars = set(",.;:!?)]}['\"-–—()[]{}")
         return all(c in punctuation_chars for c in stripped)
 
-    def _is_punctuation_in_entity(
+    def _token_overlaps_entity(
         self,
-        punct_text: str,
-        word_idx: int,
-        words_original: list[str] | None,
+        token_start: int,
+        token_end: int,
+        entity_label: str,
         privacy_mask_with_positions: list[dict[str, Any]] | None,
     ) -> bool:
-        """Check if punctuation is part of an entity value (e.g., comma in 'Google, Inc.')."""
+        """Check whether a token span overlaps an entity span with the same label."""
         if (
-            not words_original
+            token_start < 0
+            or token_end <= token_start
             or not privacy_mask_with_positions
-            or word_idx >= len(words_original)
         ):
             return False
 
-        original_word = words_original[word_idx]
-        word_without_punct = original_word.rstrip(",.;:!?)]}")
-
         for item in privacy_mask_with_positions:
-            entity_value = item.get("value", "")
-            # Punctuation is part of entity if both:
-            # 1. Punctuation char is in the entity value
-            # 2. The word (without trailing punct) is part of the entity
-            if punct_text in entity_value and word_without_punct in entity_value:
+            if item.get("label") != entity_label:
+                continue
+            entity_start = item.get("start", 0)
+            entity_end = item.get("end", 0)
+            if token_start < entity_end and entity_start < token_end:
                 return True
         return False
 
-    def _get_label_id(self, word_label: str, is_beginning: bool) -> int:
-        """Get the label ID for a word label with B-/I- prefix."""
-        if word_label == "O":
-            return 0
-        prefix = "B-" if is_beginning else "I-"
-        return self.label2id.get(f"{prefix}{word_label}", 0)
-
-    def _align_labels_with_tokens(
+    def _best_entity_for_token(
         self,
-        word_labels: list[str],
-        word_ids: list[int | None],
-        token_texts: list[str] | None = None,
-        words_original: list[str] | None = None,
-        privacy_mask_with_positions: list[dict[str, Any]] | None = None,
-    ) -> list[int]:
-        """Align word-level labels with token IDs."""
-        label_ids = []
-        prev_word_idx = None
-        prev_word_label = None
+        token_start: int,
+        token_end: int,
+        privacy_mask_with_positions: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return the entity span with the largest overlap for a token."""
+        best_entity = None
+        best_overlap = 0
 
-        for idx, word_idx in enumerate(word_ids):
-            # Handle special tokens and out-of-bounds
-            if word_idx is None or word_idx >= len(word_labels):
+        for item in privacy_mask_with_positions:
+            entity_start = item.get("start", 0)
+            entity_end = item.get("end", 0)
+            overlap = max(
+                0,
+                min(token_end, entity_end) - max(token_start, entity_start),
+            )
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_entity = item
+
+        return best_entity
+
+    def _get_label_id(self, bio_label: str) -> int:
+        """Get the label ID for a BIO-prefixed label (e.g. ``B-EMAIL``, ``I-SSN``, ``O``)."""
+        if bio_label == "O":
+            return 0
+        return self.label2id.get(bio_label, 0)
+
+    def _align_labels_with_offsets(
+        self,
+        token_offsets: list[tuple[int, int]] | None,
+        token_texts: list[str] | None,
+        privacy_mask_with_positions: list[dict[str, Any]],
+    ) -> list[int]:
+        """Align BIO labels directly from character spans to token offsets."""
+        if token_offsets is None:
+            return []
+
+        sorted_positions = sorted(
+            privacy_mask_with_positions,
+            key=lambda item: (item["start"], item["end"], item["label"]),
+        )
+        label_ids = []
+        prev_entity_key = None
+
+        for idx, (token_start, token_end) in enumerate(token_offsets):
+            if token_end <= token_start:
                 label_ids.append(-100)
+                prev_entity_key = None
                 continue
 
-            word_label = word_labels[word_idx]
             token_text = (
                 token_texts[idx] if token_texts and idx < len(token_texts) else ""
             )
-            is_punct = self._is_punctuation_only(token_text)
-
-            # Determine effective label for this token
-            if is_punct:
-                # Punctuation: only label as entity if it's actually part of entity value
-                if word_label != "O" and not self._is_punctuation_in_entity(
-                    token_text.strip(),
-                    word_idx,
-                    words_original,
-                    privacy_mask_with_positions,
-                ):
-                    # Punctuation after entity (e.g., comma after "Smith") -> "O"
-                    word_label = "O"
-
-            # Determine if this is beginning of entity or inside
-            is_beginning = (prev_word_idx != word_idx) or (
-                prev_word_label != word_label
+            entity = self._best_entity_for_token(
+                token_start,
+                token_end,
+                sorted_positions,
             )
-            label_ids.append(self._get_label_id(word_label, is_beginning))
+            if entity is None:
+                label_ids.append(0)
+                prev_entity_key = None
+                continue
 
-            prev_word_idx = word_idx
-            prev_word_label = word_label
+            label = entity["label"]
+            entity_key = (entity["start"], entity["end"], label)
+            prefix = "I" if entity_key == prev_entity_key else "B"
 
-        # Truncate to max_length if needed
-        if len(label_ids) > 512:
-            label_ids = label_ids[:511] + [-100]
+            # Keep punctuation that is inside the entity span (email dots, phone
+            # separators), but leave standalone punctuation outside spans as O.
+            if self._is_punctuation_only(
+                token_text
+            ) and not self._token_overlaps_entity(
+                token_start,
+                token_end,
+                label,
+                sorted_positions,
+            ):
+                label_ids.append(0)
+                prev_entity_key = None
+                continue
+
+            label_ids.append(self._get_label_id(f"{prefix}-{label}"))
+            prev_entity_key = entity_key
 
         return label_ids
 
@@ -203,24 +219,13 @@ class TokenizationProcessor:
             text, privacy_mask
         )
 
-        # Create word-level labels
-        word_labels = self._create_word_labels(text, privacy_mask_with_positions)
-
-        # Tokenize the original text
-        words_original = text.split()
         tokenized = self.tokenizer(
-            words_original,
+            text,
             truncation=True,
-            is_split_into_words=True,
             max_length=512,
             return_offsets_mapping=True,
         )
-
-        # Get word IDs for alignment
-        try:
-            word_ids = tokenized.word_ids(batch_index=0)
-        except (TypeError, AttributeError):
-            word_ids = tokenized.word_ids()
+        token_offsets = tokenized.get("offset_mapping")
 
         # Get token texts to check for punctuation-only tokens
         # Use raw token strings for better punctuation detection
@@ -262,12 +267,12 @@ class TokenizationProcessor:
         except (TypeError, KeyError, IndexError, AttributeError):
             token_texts = None
 
-        # Align labels with tokens
-        label_ids = self._align_labels_with_tokens(
-            word_labels,
-            word_ids,
+        # Align labels directly from annotation character spans. This handles
+        # compact formats such as XML/JSON/email addresses where entities are
+        # embedded inside a whitespace-delimited "word".
+        label_ids = self._align_labels_with_offsets(
+            token_offsets,
             token_texts,
-            words_original,
             privacy_mask_with_positions,
         )
 

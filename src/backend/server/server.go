@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hannes/kiji-private/src/backend/config"
+	"github.com/hannes/kiji-private/src/backend/paths"
 	"github.com/hannes/kiji-private/src/backend/providers"
 	"github.com/hannes/kiji-private/src/backend/proxy"
 	"golang.org/x/time/rate"
@@ -553,11 +554,23 @@ type PIICheckRequest struct {
 	Message string `json:"message"`
 }
 
+// DetectedEntity represents a single detected PII entity with its label and
+// character span in the original input. Exposed so evaluation harnesses can
+// compute per-label precision/recall without re-running a detector.
+type DetectedEntity struct {
+	Label      string  `json:"label"`
+	Original   string  `json:"original"`
+	Start      int     `json:"start"`
+	End        int     `json:"end"`
+	Confidence float64 `json:"confidence"`
+}
+
 // PIICheckResponse represents the response for PII checking
 type PIICheckResponse struct {
-	MaskedMessage string            `json:"masked_message"`
-	Entities      map[string]string `json:"entities"`
-	PIIFound      bool              `json:"pii_found"`
+	MaskedMessage    string            `json:"masked_message"`
+	Entities         map[string]string `json:"entities"`
+	DetectedEntities []DetectedEntity  `json:"detected_entities"`
+	PIIFound         bool              `json:"pii_found"`
 }
 
 // handlePIICheck checks a message for PII and returns masked version with entities
@@ -601,23 +614,31 @@ func (s *Server) handlePIICheck(w http.ResponseWriter, r *http.Request) {
 	// Use the handler's masking service to check for PII
 	maskedText, maskedToOriginal, entities := s.handler.MaskPIIInText(req.Message)
 
-	// Build entities map (label -> original text)
-	entitiesMap := make(map[string]string)
-	for _, entity := range entities {
-		entitiesMap[entity.Label] = entity.Text
-	}
-
-	// If there are multiple entities of the same type, we need to handle that
-	// Let's use masked -> original mapping instead for more detail
+	// masked -> original map (consumed by UI)
 	entityDetails := make(map[string]string)
 	for masked, original := range maskedToOriginal {
 		entityDetails[masked] = original
 	}
 
+	// detected_entities carries per-entity labels and spans so evaluators can
+	// score detection against a labeled dataset. The chrome extension derives
+	// its masked->label lookup from this to render the entity type column.
+	detected := make([]DetectedEntity, 0, len(entities))
+	for _, e := range entities {
+		detected = append(detected, DetectedEntity{
+			Label:      e.Label,
+			Original:   e.Text,
+			Start:      e.StartPos,
+			End:        e.EndPos,
+			Confidence: e.Confidence,
+		})
+	}
+
 	response := PIICheckResponse{
-		MaskedMessage: maskedText,
-		Entities:      entityDetails,
-		PIIFound:      len(entities) > 0,
+		MaskedMessage:    maskedText,
+		Entities:         entityDetails,
+		DetectedEntities: detected,
+		PIIFound:         len(entities) > 0,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -732,8 +753,7 @@ func (s *Server) handleCACert(w http.ResponseWriter, r *http.Request) {
 	// We need to access the cert manager - for now, read from disk
 	caPath := s.config.Proxy.CAPath
 	if caPath == "" {
-		homeDir, _ := os.UserHomeDir()
-		caPath = filepath.Join(homeDir, "Library", "Application Support", "Kiji Privacy Proxy", "certs", "ca.crt")
+		caPath = filepath.Join(paths.AppDataDir(), "certs", "ca.crt")
 	}
 
 	data, err := os.ReadFile(caPath)

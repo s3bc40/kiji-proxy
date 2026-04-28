@@ -1,7 +1,7 @@
 {
   "name": "kiji-privacy-proxy",
   "productName": "Kiji Privacy Proxy",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "description": "Dataiku's Kiji Privacy Proxy",
   "author": "Dataiku - Open Source Lab",
   "main": "src/electron/electron-main.js",
@@ -47,20 +47,20 @@
     "autoprefixer": "^10.5.0",
     "babel-loader": "^10.1.1",
     "css-loader": "^6.8.0",
-    "electron": "^41.2.0",
+    "electron": "^41.2.1",
     "electron-builder": "^26.7.0",
     "eslint": "^9.39.2",
     "eslint-plugin-react": "^7.33.0",
-    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "html-webpack-plugin": "^5.6.6",
     "mini-css-extract-plugin": "^2.10.0",
-    "postcss": "^8.5.6",
+    "postcss": "^8.5.10",
     "postcss-loader": "^8.2.1",
     "style-loader": "^3.3.0",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.0",
     "webpack": "^5.105.4",
-    "webpack-cli": "^6.0.1",
+    "webpack-cli": "^7.0.2",
     "webpack-dev-server": "^5.2.3"
   },
   "build": {
@@ -85,7 +85,6 @@
       "assets/icon.png",
       "assets/icon-16.png",
       "assets/arrow.png",
-      "!**/model.onnx",
       "!**/pii_onnx_model/**/*",
       "!**/*.map",
       "!**/.DS_Store"
@@ -101,7 +100,6 @@
         "to": "resources",
         "filter": [
           "**/*",
-          "!**/model.onnx",
           "!**/pii_onnx_model/**/*"
         ]
       }
@@ -151,7 +149,8 @@
       },
       "format": "UDZO",
       "artifactName": "${productName}-${version}.${ext}",
-      "sign": false
+      "sign": false,
+      "size": "3g"
     },
     "win": {
       "target": [
