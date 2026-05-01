@@ -95,11 +95,10 @@ jobs:
       - name: Create Pull Request
         if: steps.changesets.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Configure git
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           # Create and checkout new branch
           BRANCH_NAME="changeset-release/main"
@@ -120,7 +119,7 @@ jobs:
           - Update \`CHANGELOG.md\` with the changes
           - Update \`.vscode/launch.json\` dev version
 
-          Once merged, a release tag (\`v${{ steps.changesets.outputs.version }}\`) will be created automatically, triggering the DMG and Linux release builds."
+          Once merged, the release workflow will build all platforms and tag \`v${{ steps.changesets.outputs.version }}\` as part of publishing the GitHub Release."
 
           # Create PR using GitHub CLI
           gh pr create \
